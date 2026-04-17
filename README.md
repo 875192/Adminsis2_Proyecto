@@ -76,3 +76,113 @@ La ruta del log se obtiene desde `config.json` (`LOG_PATH`).
 | `LOG_PATH` | `src/servidor/logs/eventos.log` | Ruta del fichero de eventos |
 
 ---
+
+## Desarrollo del proyecto
+
+Leyenda de estado: `[HECHO]` implementado y funcional · `[PARCIAL]` implementado pero con dependencias pendientes · `[PENDIENTE]` sin implementar
+
+---
+
+### Requisitos de Usuario (Cliente)
+
+**RU-1 — Alta de nuevo cliente sin argumentos**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 1
+- Descripción: —
+- Pendiente: —
+
+**RU-2 — Alta de nuevo cliente pasando IP de servidor**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 1
+- Descripción: —
+- Pendiente: —
+
+**RU-3 — Parada de ejecución si no hay servidores**
+- Estado: `[PARCIAL]`
+- Responsable: Persona 3
+- Descripción: `detector_servidor.py` para su ejecución cuando `intentar_reconexion()` agota todos los servidores disponibles y devuelve `None`
+- Pendiente: la lista real de servidores la proveerá Persona 1 (actualmente stub)
+
+**RU-4 — Monitorización del cliente por un servidor**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 4
+- Descripción: —
+- Pendiente: —
+
+**RU-5 — Envío de información de monitorización al servidor**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 2
+- Descripción: —
+- Pendiente: —
+
+**RU-6 — Detección de caída del servidor y reconexión transparente**
+- Estado: `[PARCIAL]`
+- Responsable: Persona 3
+- Descripción: `detector_servidor.py` cuenta fallos consecutivos de heartbeat y llama a `reconexion.py` para conectarse a otro servidor de forma transparente. Al reconectarse informa al nuevo servidor del servidor caído.
+- Pendiente: integración con el canal TCP real de Persona 2 y lista de servidores de Persona 1
+
+---
+
+### Requisitos de Servidor
+
+**SRV-1 — Alta de nuevo servidor sin argumentos**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 1
+- Descripción: —
+- Pendiente: —
+
+**SRV-2 — Alta de nuevo servidor con IP de otro servidor**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 1
+- Descripción: —
+- Pendiente: —
+
+**SRV-3 — Recepción de peticiones de alta por TCP**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 2
+- Descripción: —
+- Pendiente: —
+
+**SRV-4 — Monitorización de los clientes asignados**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 2
+- Descripción: —
+- Pendiente: —
+
+**SRV-5 — Monitorización de aspectos del cliente (ancho de banda, SO, CPU, memoria, almacenamiento, red)**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 4
+- Descripción: —
+- Pendiente: —
+
+**SRV-6 — Almacenar eventos en fichero log**
+- Estado: `[PARCIAL]`
+- Responsable: Persona 3
+- Descripción: `monitorizacion/logger.py` escribe en `src/servidor/logs/eventos.log` con formato acordado. Registra `CAIDA_CLIENTE`, `CAIDA_SERVIDOR` y `RECONEXION`. Solo el servidor escribe en el log.
+- Pendiente: Persona 4 puede ampliar con más tipos de evento usando el mismo módulo
+
+**SRV-7 — Almacenar datos monitorizados en fichero log**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 4
+- Descripción: —
+- Pendiente: —
+
+**SRV-8 — Carga del servidor por tiempo de monitorización y hardware**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 4
+- Descripción: —
+- Pendiente: —
+
+**SRV-9 — Reasignación de cliente a servidor con menor carga**
+- Estado: `[PENDIENTE]`
+- Responsable: Persona 4
+- Descripción: —
+- Pendiente: —
+
+**SRV-10 — Notificación al administrador ante caída de cliente**
+- Estado: `[PARCIAL]`
+- Responsable: Persona 3
+- Descripción: `monitor_clientes.py` llama a `notificar_admin(ip)` cuando el watchdog detecta que un cliente ha dejado de enviar heartbeats
+- Pendiente: implementación real del canal de notificación por Persona 2 (actualmente stub)
+
+---
