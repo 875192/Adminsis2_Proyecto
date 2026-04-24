@@ -10,12 +10,17 @@ Gestiona N servidores y N clientes de forma autónoma, sin intervención del adm
 ```
 src/
 ├── cliente/
+│   ├── monitorizacion/
+│   │   ├── __init__.py              # Inicialización del módulo de monitorización de cliente
+│   │   └── cliente_monitor.py       # RU4 — Cliente monitorizado por un servidor
 │   └── tolerancia_fallos/
 │       ├── detector_servidor.py     # CU3 — Detecta caída del servidor y se reconecta
 │       └── reconexion.py            # Lógica de reconexión a un nuevo servidor
 └── servidor/
     ├── monitorizacion/
-    │   └── logger.py                # Módulo de log compartido — usar desde cualquier componente
+    │   ├── logger.py                # Módulo de log compartido — usar desde cualquier componente
+    │   ├── metricas.py              # SRV5/SRV7/SRV8 — Recogida de métricas y cálculo de carga
+    │   └── servidor_monitor.py      # SRV5/SRV7/SRV8/SRV9 — Monitorización y reasignación
     ├── logs/
     │   └── eventos.log              # Fichero de eventos (generado en tiempo de ejecución)
     └── tolerancia_fallos/
@@ -104,9 +109,9 @@ Leyenda de estado: `[HECHO]` implementado y funcional · `[PARCIAL]` implementad
 - Pendiente: la lista real de servidores la proveerá Persona 1 (actualmente stub)
 
 **RU-4 — Monitorización del cliente por un servidor**
-- Estado: `[PENDIENTE]`
+- Estado: `[HECHO]`
 - Responsable: Persona 4
-- Descripción: —
+- Descripción: `cliente_monitor.py` permite que, una vez dado de alta el cliente en un servidor operativo, quede monitorizado por dicho servidor y mantenga el envío periódico de información de monitorización.
 - Pendiente: —
 
 **RU-5 — Envío de información de monitorización al servidor**
@@ -150,9 +155,9 @@ Leyenda de estado: `[HECHO]` implementado y funcional · `[PARCIAL]` implementad
 - Pendiente: —
 
 **SRV-5 — Monitorización de aspectos del cliente (ancho de banda, SO, CPU, memoria, almacenamiento, red)**
-- Estado: `[PENDIENTE]`
+- Estado: `[HECHO]`
 - Responsable: Persona 4
-- Descripción: —
+- Descripción: `metricas.py` y `servidor_monitor.py` recogen y procesan de cada cliente el ancho de banda de subida, sistema operativo e información del nodo, usuarios, CPU, memoria, almacenamiento y red.
 - Pendiente: —
 
 **SRV-6 — Almacenar eventos en fichero log**
@@ -162,21 +167,21 @@ Leyenda de estado: `[HECHO]` implementado y funcional · `[PARCIAL]` implementad
 - Pendiente: Persona 4 puede ampliar con más tipos de evento usando el mismo módulo
 
 **SRV-7 — Almacenar datos monitorizados en fichero log**
-- Estado: `[PENDIENTE]`
+- Estado: `[HECHO]`
 - Responsable: Persona 4
-- Descripción: —
+- Descripción: `servidor_monitor.py` almacena en `src/servidor/logs/datos_monitorizados.log` los datos monitorizados recibidos de sus clientes.
 - Pendiente: —
 
 **SRV-8 — Carga del servidor por tiempo de monitorización y hardware**
-- Estado: `[PENDIENTE]`
+- Estado: `[HECHO]`
 - Responsable: Persona 4
-- Descripción: —
+- Descripción: `metricas.py` calcula la carga del servidor a partir del tiempo medio de monitorización, el número de clientes activos y la información hardware disponible, guardándola en ficheros `carga_srv*.json`.
 - Pendiente: —
 
 **SRV-9 — Reasignación de cliente a servidor con menor carga**
-- Estado: `[PENDIENTE]`
+- Estado: `[HECHO]`
 - Responsable: Persona 4
-- Descripción: —
+- Descripción: `servidor_monitor.py` compara la carga local con la de otros servidores conocidos y solicita la reasignación del cliente a otro servidor cuando detecta menor carga.
 - Pendiente: —
 
 **SRV-10 — Notificación al administrador ante caída de cliente**
