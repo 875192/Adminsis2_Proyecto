@@ -249,14 +249,27 @@ def _enviar_mensaje(ip: str, puerto: int, payload: dict[str, Any]) -> str | None
     return respuesta.decode("utf-8").strip()
 
 
-def _registrar_cliente(ip: str, puerto: int, id_cliente: str, servidores: list[str]) -> str | None:
+def _registrar_cliente(
+    ip: str, puerto: int, id_cliente: str, servidores: list[str], intervalo_default: float = 5.0
+) -> float | None:
+    """Registra el cliente en el servidor y devuelve el intervalo de monitorización
+    especificado por el servidor en su MONITOR_REQUEST (RU-5).
+    Devuelve None si el servidor no responde."""
     payload = {
         "type": "REGISTER",
         "client_id": id_cliente,
         "client_ip": socket.gethostbyname(socket.gethostname()) if socket.gethostname() else "127.0.0.1",
         "known_servers": servidores,
     }
-    return _enviar_mensaje(ip, puerto, payload)
+    respuesta = _enviar_mensaje(ip, puerto, payload)
+    if respuesta is None:
+        return None
+    if respuesta.startswith("MONITOR_REQUEST"):
+        try:
+            return float(respuesta.split()[1])
+        except (IndexError, ValueError):
+            pass
+    return intervalo_default
 
 
 def _parsear_destino(texto: str) -> tuple[str, int] | None:
@@ -279,9 +292,9 @@ def _parsear_destino(texto: str) -> tuple[str, int] | None:
 def ejecutar(
     ip_servidor: str,
     puerto: int,
-    intervalo: float,
     id_cliente: str,
     servidores: list[str],
+    intervalo_default: float = 5.0,
 ) -> None:
     cpu_anterior = _leer_cpu_snapshot()
     tx_anterior = _tx_bytes_total()
@@ -289,12 +302,17 @@ def ejecutar(
 
     servidor_actual = (ip_servidor, puerto)
 
-    respuesta = _registrar_cliente(ip_servidor, puerto, id_cliente, servidores)
-    if respuesta is None:
+    # CU2 + RU-5: el cliente se registra y el servidor responde con MONITOR_REQUEST
+    # indicando cada cuántos segundos debe enviar métricas.
+    intervalo = _registrar_cliente(ip_servidor, puerto, id_cliente, servidores, intervalo_default)
+    if intervalo is None:
         print("[ERROR] No se ha podido registrar el cliente en el servidor inicial.")
         return
 
-    print(f"[INFO] Cliente monitorizado por {servidor_actual[0]}:{servidor_actual[1]}")
+    print(
+        f"[INFO] Cliente registrado. Servidor: {servidor_actual[0]}:{servidor_actual[1]} "
+        f"— intervalo de monitorización: {intervalo}s"
+    )
 
     try:
         while True:
@@ -317,12 +335,16 @@ def ejecutar(
                     print(
                         f"[INFO] Cliente reasignado a {servidor_actual[0]}:{servidor_actual[1]}"
                     )
-                    _registrar_cliente(
+                    # RS-9 + RU-5: el nuevo servidor también envía MONITOR_REQUEST
+                    nuevo_intervalo = _registrar_cliente(
                         servidor_actual[0],
                         servidor_actual[1],
                         id_cliente,
                         servidores,
+                        intervalo,
                     )
+                    if nuevo_intervalo is not None:
+                        intervalo = nuevo_intervalo
             time.sleep(intervalo)
 
     except KeyboardInterrupt:
@@ -334,7 +356,7 @@ def ejecutar(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cliente de monitorización (RU4)")
+    parser = argparse.ArgumentParser(description="Cliente de monitorización (CU2, RU-5, RS-3, RS-4)")
     parser.add_argument("ip_servidor", help="IP del servidor inicial")
     parser.add_argument(
         "--puerto",
@@ -345,8 +367,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--intervalo",
         type=float,
-        default=3.0,
-        help="Segundos entre envíos de métricas",
+        default=None,
+        help="Intervalo de monitorización por defecto (segundos). "
+             "El servidor puede sobreescribirlo con MONITOR_REQUEST.",
     )
     parser.add_argument(
         "--id-cliente",
@@ -363,10 +386,11 @@ if __name__ == "__main__":
 
     config = _cargar_config()
     puerto = args.puerto if args.puerto is not None else int(config["PUERTO_TCP"])
+    intervalo_default = args.intervalo if args.intervalo is not None else float(config.get("MONITOR_INTERVAL", 5))
     ejecutar(
         ip_servidor=args.ip_servidor,
         puerto=puerto,
-        intervalo=args.intervalo,
         id_cliente=args.id_cliente,
         servidores=args.servidores,
+        intervalo_default=intervalo_default,
     )
