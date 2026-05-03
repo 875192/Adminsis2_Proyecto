@@ -213,7 +213,10 @@ class _Handler(socketserver.BaseRequestHandler):
                 client_ip=payload.get("client_ip", self.client_address[0]),
                 known_servers=payload.get("known_servers", []),
             )
-            self.request.sendall(b"REGISTER_OK")
+            # RU-5: el servidor manda una petición al cliente para que comience
+            # a enviar métricas, indicándole el intervalo de monitorización.
+            intervalo = int(estado.config.get("MONITOR_INTERVAL", 5))
+            self.request.sendall(f"MONITOR_REQUEST {intervalo}".encode("utf-8"))
             return
 
         if tipo == "METRICS":
