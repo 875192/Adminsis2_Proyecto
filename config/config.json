@@ -4,5 +4,7 @@
   "MAX_FALLOS": 3,
   "PUERTO_TCP": 9000,
   "LOG_PATH": "src/servidor/logs/eventos.log",
-  "MONITOR_INTERVAL": 5
+  "MONITOR_INTERVAL": 5,
+  "ADMIN_HOST": "",
+  "ADMIN_PUERTO": 9099
 }

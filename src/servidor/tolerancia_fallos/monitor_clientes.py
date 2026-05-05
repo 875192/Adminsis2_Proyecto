@@ -38,6 +38,8 @@ def _watchdog(
     ruta_log: str,
     activo: threading.Event,
     intervalo: float,
+    admin_host: str,
+    admin_puerto: int,
 ) -> None:
     """
     Hilo daemon que comprueba periódicamente si algún cliente ha dejado de
@@ -57,7 +59,7 @@ def _watchdog(
 
         for client_id, client_ip in caidos:
             _log(ruta_log, "CAIDA_CLIENTE", f"client_ip={client_ip}")
-            notificar_admin(client_ip)
+            notificar_admin(client_ip, admin_host, admin_puerto)
             with estado.lock:
                 estado.clientes.pop(client_id, None)
 
@@ -85,16 +87,18 @@ def iniciar_watchdog(estado, ruta_log: str, config: dict) -> threading.Event:
         Evento activo mientras el watchdog está en marcha.
         Llama a activo.clear() para detenerlo.
     """
-    intervalo: float = config["HEARTBEAT_INTERVAL"]
-    max_fallos: int  = config["MAX_FALLOS"]
-    umbral: float    = max_fallos * intervalo
+    intervalo: float  = config["HEARTBEAT_INTERVAL"]
+    max_fallos: int   = config["MAX_FALLOS"]
+    umbral: float     = max_fallos * intervalo
+    admin_host: str   = config.get("ADMIN_HOST", "")
+    admin_puerto: int = int(config.get("ADMIN_PUERTO", 9099))
 
     activo = threading.Event()
     activo.set()
 
     hilo = threading.Thread(
         target=_watchdog,
-        args=(estado, umbral, ruta_log, activo, intervalo),
+        args=(estado, umbral, ruta_log, activo, intervalo, admin_host, admin_puerto),
         daemon=True,
     )
     hilo.start()

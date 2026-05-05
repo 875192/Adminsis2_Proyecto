@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import socket
 import socketserver
 import sys
@@ -320,7 +321,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Servidor de monitorización")
     parser.add_argument("--host", default="0.0.0.0", help="IP en la que escuchar")
     parser.add_argument("--puerto", type=int, default=None, help="Puerto TCP")
-    parser.add_argument("--id", dest="id_servidor", default="srv1", help="Identificador lógico")
+    parser.add_argument("--id", dest="id_servidor", default=platform.node() or socket.gethostname() or "srv1", help="Identificador lógico")
     parser.add_argument(
         "--servidores",
         nargs="*",
