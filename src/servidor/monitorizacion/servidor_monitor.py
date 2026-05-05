@@ -31,6 +31,9 @@ from typing import Any
 from logger import _log
 from metricas import calcular_carga, guardar_carga, registrar_datos_monitorizados
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from tolerancia_fallos.monitor_clientes import iniciar_watchdog
+
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -188,10 +191,37 @@ class _Handler(socketserver.BaseRequestHandler):
         mensaje = datos.decode("utf-8").strip()
 
         if mensaje == "HEARTBEAT":
+            client_ip = self.client_address[0]
+            with estado.lock:
+                for datos in estado.clientes.values():
+                    if datos["client_ip"] == client_ip:
+                        datos["last_seen"] = time.time()
+                        break
             self.request.sendall(b"HEARTBEAT_ACK")
             return
 
         if mensaje.startswith("RECONNECT_REQUEST"):
+            client_ip = self.client_address[0]
+            partes = mensaje.split()
+            ip_caido = next(
+                (p.split("=", 1)[1] for p in partes if p.startswith("server_caido=")),
+                None,
+            )
+            if ip_caido:
+                _log(estado.ruta_eventos, "CAIDA_SERVIDOR", f"server_ip={ip_caido}")
+            _log(estado.ruta_eventos, "RECONEXION", f"client_ip={client_ip}")
+            with estado.lock:
+                for datos in estado.clientes.values():
+                    if datos["client_ip"] == client_ip:
+                        datos["last_seen"] = time.time()
+                        break
+                else:
+                    estado.clientes[client_ip] = {
+                        "client_ip": client_ip,
+                        "last_seen": time.time(),
+                        "known_servers": [],
+                        "metrics": None,
+                    }
             self.request.sendall(b"RECONNECT_OK")
             return
 
@@ -272,6 +302,8 @@ def ejecutar(
         umbral_reasignacion=umbral_reasignacion,
     )
 
+    activo_watchdog = iniciar_watchdog(estado, estado.ruta_eventos, config)
+
     with _ThreadingTCPServer((host, puerto), _Handler) as servidor:
         servidor.estado = estado  # type: ignore[attr-defined]
         print(f"[INFO] Servidor {id_servidor} escuchando en {host}:{puerto}")
@@ -280,6 +312,7 @@ def ejecutar(
         except KeyboardInterrupt:
             print("\n[INFO] Servidor de monitorización detenido manualmente.")
         finally:
+            activo_watchdog.clear()
             servidor.shutdown()
 
 

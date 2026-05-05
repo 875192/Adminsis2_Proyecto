@@ -1,23 +1,23 @@
 """
 Monitor de clientes — CU4 (Persona 3: Tolerancia a Fallos)
 
-Lógica principal del servidor:
-  - Escucha HEARTBEATs entrantes de los clientes asignados.
-  - Lleva un registro del último heartbeat recibido por cada cliente.
-  - Un hilo watchdog comprueba periódicamente si algún cliente ha
-    superado el umbral MAX_FALLOS * HEARTBEAT_INTERVAL sin dar señal.
-  - Si un cliente supera el umbral: declara su caída, registra el evento
-    en logs/eventos.log y notifica al administrador (SRV-10).
+Lógica del watchdog del servidor:
+  - Comprueba periódicamente el campo last_seen de cada cliente registrado.
+  - Si un cliente supera MAX_FALLOS * HEARTBEAT_INTERVAL segundos sin señal,
+    declara su caída, registra el evento en logs/eventos.log (RS-6) y
+    notifica al administrador (RS-10).
 
-Uso:
-    python monitor_clientes.py <ip1> [<ip2> ...] [--modo-fallo <ip>]
+Este módulo no abre ningún socket TCP propio; se integra con servidor_monitor.py
+que ya escucha en el puerto 9000 y actualiza estado.clientes en cada HEARTBEAT
+o METRICS recibido.
 
-    --modo-fallo <ip>   Simula que ese cliente deja de enviar heartbeats
-                        tras MAX_FALLOS mensajes (para probar CU4).
+Uso (integrado en servidor_monitor.py):
+    from tolerancia_fallos.monitor_clientes import iniciar_watchdog
+    activo = iniciar_watchdog(estado, ruta_log, config)
+    # Al cerrar el servidor:
+    activo.clear()
 """
 
-import argparse
-import json
 import os
 import sys
 import threading
@@ -25,20 +25,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from monitorizacion.logger import _log
-from stubs.tcp_escucha import EscuchaTCP
-from stubs.notificacion_admin import notificar_admin
-
-
-# ---------------------------------------------------------------------------
-# Configuración
-# ---------------------------------------------------------------------------
-
-def _cargar_config() -> dict:
-    ruta = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "config", "config.json"
-    )
-    with open(os.path.normpath(ruta), encoding="utf-8") as f:
-        return json.load(f)
+from tolerancia_fallos.notificacion_admin import notificar_admin
 
 
 # ---------------------------------------------------------------------------
@@ -46,128 +33,69 @@ def _cargar_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _watchdog(
-    ultimo_heartbeat: dict[str, float],
-    lock: threading.Lock,
+    estado,
     umbral: float,
     ruta_log: str,
     activo: threading.Event,
     intervalo: float,
 ) -> None:
     """
-    Hilo que comprueba periódicamente si algún cliente ha dejado de
-    enviar heartbeats. Se ejecuta en segundo plano.
+    Hilo daemon que comprueba periódicamente si algún cliente ha dejado de
+    enviar señales (HEARTBEAT o METRICS). Opera sobre estado.clientes de
+    EstadoMonitor (servidor_monitor.py).
     """
     while activo.is_set():
         time.sleep(intervalo)
-        ahora = time.monotonic()
+        ahora = time.time()
 
-        with lock:
+        with estado.lock:
             caidos = [
-                ip
-                for ip, ts in list(ultimo_heartbeat.items())
-                if ahora - ts > umbral
+                (client_id, datos["client_ip"])
+                for client_id, datos in list(estado.clientes.items())
+                if ahora - datos["last_seen"] > umbral
             ]
 
-        for ip in caidos:
-            _log(ruta_log, "CAIDA_CLIENTE", f"client_ip={ip}")
-            notificar_admin(ip)
-            with lock:
-                ultimo_heartbeat.pop(ip, None)
+        for client_id, client_ip in caidos:
+            _log(ruta_log, "CAIDA_CLIENTE", f"client_ip={client_ip}")
+            notificar_admin(client_ip)
+            with estado.lock:
+                estado.clientes.pop(client_id, None)
 
 
 # ---------------------------------------------------------------------------
-# Bucle principal
+# API pública
 # ---------------------------------------------------------------------------
 
-def ejecutar(clientes: list[str], ip_fallo: str | None = None) -> None:
-    config = _cargar_config()
+def iniciar_watchdog(estado, ruta_log: str, config: dict) -> threading.Event:
+    """
+    Arranca el hilo watchdog y devuelve el evento de control.
 
+    Parámetros
+    ----------
+    estado : EstadoMonitor
+        Estado compartido del servidor (de servidor_monitor.py).
+    ruta_log : str
+        Ruta absoluta al fichero logs/eventos.log.
+    config : dict
+        Configuración global del sistema (config.json).
+
+    Retorna
+    -------
+    threading.Event
+        Evento activo mientras el watchdog está en marcha.
+        Llama a activo.clear() para detenerlo.
+    """
     intervalo: float = config["HEARTBEAT_INTERVAL"]
-    timeout: float   = config["HEARTBEAT_TIMEOUT"]
     max_fallos: int  = config["MAX_FALLOS"]
-    ruta_log: str    = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", config["LOG_PATH"])
-    )
-
-    umbral = max_fallos * intervalo
-
-    modo_fallo = {ip_fallo: max_fallos} if ip_fallo else {}
-    escucha = EscuchaTCP(
-        clientes=clientes,
-        intervalo=intervalo,
-        modo_fallo=modo_fallo,
-    )
-
-    # Inicializa timestamps con el momento actual
-    lock = threading.Lock()
-    ultimo_heartbeat: dict[str, float] = {ip: time.monotonic() for ip in clientes}
+    umbral: float    = max_fallos * intervalo
 
     activo = threading.Event()
     activo.set()
 
-    hilo_watchdog = threading.Thread(
+    hilo = threading.Thread(
         target=_watchdog,
-        args=(ultimo_heartbeat, lock, umbral, ruta_log, activo, intervalo),
+        args=(estado, umbral, ruta_log, activo, intervalo),
         daemon=True,
     )
-    hilo_watchdog.start()
-
-    print(f"[INFO] Servidor iniciado. Monitorizando: {', '.join(clientes)}")
-
-    try:
-        while True:
-            resultado = escucha.siguiente_heartbeat(timeout=timeout)
-
-            if resultado is not None:
-                ip_cliente, mensaje = resultado
-                if mensaje == "HEARTBEAT":
-                    with lock:
-                        if ip_cliente in ultimo_heartbeat:
-                            ultimo_heartbeat[ip_cliente] = time.monotonic()
-
-                elif mensaje.startswith("RECONNECT_REQUEST"):
-                    # El cliente informa de qué servidor le ha caído (CU3)
-                    partes = mensaje.split()
-                    ip_caido = next(
-                        (p.split("=", 1)[1] for p in partes if p.startswith("server_caido=")),
-                        None,
-                    )
-                    if ip_caido:
-                        _log(ruta_log, "CAIDA_SERVIDOR", f"server_ip={ip_caido}")
-                    _log(ruta_log, "RECONEXION", f"client_ip={ip_cliente}")
-                    with lock:
-                        ultimo_heartbeat[ip_cliente] = time.monotonic()
-
-            # Si no quedan clientes activos, no hay nada que monitorizar
-            with lock:
-                if not ultimo_heartbeat:
-                    print("[INFO] No quedan clientes activos. Cerrando monitor.")
-                    break
-
-    except KeyboardInterrupt:
-        print("\n[INFO] Monitor detenido manualmente.")
-    finally:
-        activo.clear()
-        escucha.cerrar()
-
-
-# ---------------------------------------------------------------------------
-# Punto de entrada
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Monitor de clientes (CU4)")
-    parser.add_argument(
-        "clientes",
-        nargs="+",
-        help="IPs de los clientes a monitorizar",
-    )
-    parser.add_argument(
-        "--modo-fallo",
-        metavar="IP",
-        default=None,
-        help="IP del cliente que simulará una caída (para probar CU4)",
-    )
-    args = parser.parse_args()
-
-    ejecutar(clientes=args.clientes, ip_fallo=args.modo_fallo)
+    hilo.start()
+    return activo
