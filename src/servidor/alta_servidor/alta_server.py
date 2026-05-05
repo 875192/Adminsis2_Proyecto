@@ -38,7 +38,7 @@ def import_zabbix_schema():
                 "mysql",
                 "--default-character-set=utf8mb4",
                 "-uzabbix",
-                "-pzabbix_password",
+                "-pZabbix_Pass1",
                 "zabbix",
             ],
             input_data=zcat.stdout.read() if zcat.stdout else "",
@@ -79,7 +79,7 @@ def main():
         run(["systemctl", "enable", "mariadb"])
 
         run(["mysql", "-e", "CREATE DATABASE zabbix character set utf8mb4 collate utf8mb4_bin;"])
-        run(["mysql", "-e", "CREATE USER 'zabbix'@'%' IDENTIFIED BY 'zabbix_password';"])
+        run(["mysql", "-e", "CREATE USER 'zabbix'@'%' IDENTIFIED BY 'Zabbix_Pass1';"])
         run(["mysql", "-e", "GRANT ALL PRIVILEGES ON zabbix.* TO 'zabbix'@'%';"])
         run(["mysql", "-e", "SET GLOBAL log_bin_trust_function_creators = 1;"])
 
@@ -98,7 +98,7 @@ def main():
         run([
             "sed",
             "-i",
-            "s/# DBPassword=/DBPassword=zabbix_password/",
+            "s/# DBPassword=/DBPassword=Zabbix_Pass1/",
             "/etc/zabbix/zabbix_server.conf",
         ])
 
@@ -116,7 +116,7 @@ def main():
         run([
             "sed",
             "-i",
-            "s/# DBPassword=/DBPassword=zabbix_password/",
+            "s/# DBPassword=/DBPassword=Zabbix_Pass1/",
             "/etc/zabbix/zabbix_server.conf",
         ])
         run([
@@ -134,7 +134,7 @@ def main():
             "$DB['PORT']     = '0';\n"
             "$DB['DATABASE'] = 'zabbix';\n"
             "$DB['USER']     = 'zabbix';\n"
-            "$DB['PASSWORD'] = 'zabbix_password';\n"
+            "$DB['PASSWORD'] = 'Zabbix_Pass1';\n"
             "$DB['ALLOW_UNSUPPORTED'] = true;\n"
             "$ZBX_SERVER      = 'localhost';\n"
             "$ZBX_SERVER_PORT = '10051';\n"

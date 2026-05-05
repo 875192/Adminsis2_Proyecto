@@ -1,0 +1,763 @@
+================================================================================
+CONTEXTO DEL PROYECTO — SISTEMA DE MONITORIZACIÓN DISTRIBUIDA
+Adminsis2 — Administración de Sistemas 2
+Fecha de generación: 2026-05-05
+================================================================================
+
+Este fichero sirve como contexto para revisión externa. Contiene la información
+técnica completa del proyecto: estructura de carpetas, ficheros Python, funciones,
+algoritmos, protocolo de mensajes y decisiones de diseño.
+
+--------------------------------------------------------------------------------
+1. DESCRIPCIÓN GENERAL
+--------------------------------------------------------------------------------
+
+Sistema de monitorización distribuido con tolerancia a fallos para entornos Linux.
+Gestiona N servidores y N clientes de forma autónoma sin intervención del
+administrador. Se adapta automáticamente ante caídas de nodos.
+
+Tecnologías:
+  - Lenguaje: Python 3.8+
+  - SO objetivo: Linux (Ubuntu/Debian)
+  - Monitorización: Zabbix con stack LAMP (Apache, MySQL, PHP)
+  - Comunicación: TCP puro (sin framework)
+  - Puerto fijo: 9000 (configurable en config.json)
+  - Control de versiones: Git (GitHub)
+
+--------------------------------------------------------------------------------
+2. ESTRUCTURA DE CARPETAS
+--------------------------------------------------------------------------------
+
+Proyecto/
+├── config/
+│   └── config.json                        -- Parámetros globales del sistema
+├── src/
+│   ├── cliente/
+│   │   ├── alta_cliente/
+│   │   │   └── alta_cliente.py            -- CU2: alta automática de cliente Zabbix
+│   │   ├── monitorizacion/
+│   │   │   ├── __init__.py
+│   │   │   └── cliente_monitor.py         -- Loop principal de cliente: métricas, heartbeat, reasignación
+│   │   └── tolerancia_fallos/
+│   │       ├── detector_servidor.py       -- CU3: detecta caída del servidor
+│   │       └── reconexion.py              -- Lógica de reconexión a nuevo servidor
+│   └── servidor/
+│       ├── alta_servidor/
+│       │   └── alta_server.py             -- CU1: instalación Zabbix + MariaDB
+│       ├── logs/
+│       │   ├── eventos.log                -- Log de eventos (generado en runtime)
+│       │   ├── datos_monitorizados.log    -- Log de métricas (newline-delimited JSON)
+│       │   └── carga_srv<id>_<port>.json  -- Carga actual del servidor (generado en runtime)
+│       ├── monitorizacion/
+│       │   ├── __init__.py
+│       │   ├── logger.py                  -- Módulo de log compartido
+│       │   ├── metricas.py                -- Cálculo de carga del servidor y log de datos
+│       │   └── servidor_monitor.py        -- Servidor TCP principal: registro, métricas, balanceo
+│       └── tolerancia_fallos/
+│           ├── monitor_clientes.py        -- CU4: watchdog de clientes caídos
+│           └── notificacion_admin.py      -- RS-10: notificación al administrador
+
+--------------------------------------------------------------------------------
+3. CONFIGURACIÓN GLOBAL (config/config.json)
+--------------------------------------------------------------------------------
+
+{
+  "HEARTBEAT_INTERVAL": 3,      -- Segundos entre heartbeats cliente→servidor
+  "HEARTBEAT_TIMEOUT": 5,       -- Segundos máximos de espera de respuesta ACK
+  "MAX_FALLOS": 3,              -- Fallos consecutivos para declarar caída de nodo
+  "PUERTO_TCP": 9000,           -- Puerto de comunicación entre todos los nodos
+  "LOG_PATH": "src/servidor/logs/eventos.log",  -- Ruta del log de eventos
+  "MONITOR_INTERVAL": 5,        -- Intervalo de monitorización por defecto (segundos)
+  "ADMIN_HOST": "",             -- IP del administrador (vacío = deshabilitado)
+  "ADMIN_PUERTO": 9099          -- Puerto de notificación al administrador
+}
+
+--------------------------------------------------------------------------------
+4. PROTOCOLO DE MENSAJES TCP
+--------------------------------------------------------------------------------
+
+Todos los mensajes viajan por TCP en texto plano (UTF-8).
+Los mensajes JSON usan el campo "type" para distinguir el tipo.
+
+Mensaje                                     Dirección              Descripción
+---------------------------------------------------------------------------
+HEARTBEAT                                   Cliente → Servidor     Comprobación de vida periódica
+HEARTBEAT_ACK                               Servidor → Cliente     Confirmación de que el servidor sigue activo
+RECONNECT_REQUEST client server_caido=<ip>  Cliente → Nuevo Srv    Solicitud de reconexión tras caída
+RECONNECT_OK                                Nuevo Srv → Cliente    Reconexión aceptada
+CLIENT_DOWN client_ip=<ip>                  Servidor → Admin       Notificación de caída de cliente
+LOAD_REQUEST                                Servidor → Servidor    Consulta de carga entre servidores
+LOAD_RESPONSE <score>                       Servidor → Servidor    Respuesta con puntuación de carga (float)
+REGISTER (JSON)                             Cliente → Servidor     Alta del cliente en el servidor
+MONITOR_REQUEST <interval>                  Servidor → Cliente     Intervalo de monitorización asignado
+METRICS (JSON)                              Cliente → Servidor     Envío de métricas capturadas
+METRICS_OK                                  Servidor → Cliente     Métricas recibidas correctamente
+REASSIGN <ip> <puerto>                      Servidor → Cliente     Redirigir a otro servidor con menos carga
+
+Formato mensaje REGISTER (JSON):
+  { "type": "REGISTER", "client_id": "<id>", "client_ip": "<ip>",
+    "known_servers": ["ip:puerto", ...], "timestamp": <float> }
+
+Formato mensaje METRICS (JSON):
+  { "type": "METRICS", "client_id": "<id>", "client_ip": "<ip>",
+    "timestamp": <float>, "metrics": { ... } }
+
+--------------------------------------------------------------------------------
+5. FICHEROS PYTHON — FUNCIONES DETALLADAS
+--------------------------------------------------------------------------------
+
+== 5.1  src/cliente/monitorizacion/cliente_monitor.py ==
+Propósito: Loop principal del cliente. Autodescubrimiento de servidor, registro,
+captura de métricas, envío, y gestión de heartbeat y reasignación.
+
+Imports: argparse, concurrent.futures, json, os, platform, pwd, shutil,
+         socket, sys, threading, time
+
+Funciones:
+  _cargar_config() -> dict
+      Carga config.json. Ruta relativa desde la raíz del proyecto.
+
+  _descubrir_servidor(puerto: int, timeout: float=0.3) -> str | None
+      Escanea la subred /24 local en paralelo (50 hilos, ThreadPoolExecutor).
+      Prueba primero localhost. Devuelve la primera IP que responde en el puerto.
+      Tiempo total ~2 segundos para una subred completa.
+
+  _leer_texto(ruta: str) -> str
+      Lee un fichero de texto con manejo de errores. Devuelve "" si falla.
+
+  _interfaces_validas() -> list[str]
+      Lista interfaces de red no-loopback desde /sys/class/net/.
+
+  _tx_bytes_total() -> int
+      Suma los bytes transmitidos (tx_bytes) de todas las interfaces válidas
+      leyendo /sys/class/net/<iface>/statistics/tx_bytes.
+
+  _usuarios_sistema() -> list[str]
+      Lista usuarios del sistema con UID >= 1000 usando pwd.getpwall().
+
+  _leer_meminfo() -> dict[str, int]
+      Parsea /proc/meminfo y devuelve un dict {campo: valor_kb}.
+
+  _almacenamiento() -> dict[str, Any]
+      Uso de disco mediante shutil.disk_usage("/") y lista de dispositivos
+      desde /sys/block/.
+
+  _tarjetas_red() -> list[dict[str, str]]
+      Detalles de interfaces: nombre, MAC (/sys/class/net/<iface>/address),
+      estado operacional (/sys/class/net/<iface>/operstate).
+
+  _leer_cpu_snapshot() -> tuple[int, int]
+      Lee la primera línea de /proc/stat y devuelve (idle, total).
+
+  _calcular_cpu_pct(anterior: tuple, actual: tuple) -> float
+      Calcula % de uso CPU entre dos snapshots:
+      uso = 100 * (1 - delta_idle / delta_total)
+
+  _carga_media() -> dict[str, float]
+      Devuelve promedios de carga 1/5/15 minutos usando os.getloadavg().
+
+  capturar_metricas(id_cliente, cpu_anterior, tx_anterior, instante_anterior)
+      -> tuple[dict, tuple, int, float]
+      Función principal de captura. Recopila: info del sistema (platform),
+      usuarios, % CPU, % memoria, ancho de banda (Bps subida).
+      Devuelve (metricas_dict, nuevo_cpu_snap, nuevo_tx, nuevo_instante).
+
+  _enviar_mensaje(ip: str, puerto: int, payload: dict) -> str | None
+      Crea socket TCP, envía JSON serializado, lee respuesta (buffer 4096).
+      Timeout: 5 segundos. Devuelve la respuesta en texto o None si falla.
+
+  _registrar_cliente(ip, puerto, id_cliente, servidores, intervalo_default=5.0)
+      -> float | None
+      Envía REGISTER. Espera MONITOR_REQUEST <intervalo>. Devuelve intervalo
+      o None si falla.
+
+  _parsear_destino(texto: str) -> tuple[str, int] | None
+      Parsea "REASSIGN <ip> <puerto>" y devuelve (ip, puerto).
+
+  _intentar_reconexion(servidor_caido, servidores, timeout) -> tuple[str,int] | None
+      Itera por los servidores conocidos (excluyendo el caído) enviando
+      RECONNECT_REQUEST. Devuelve el primer servidor que responda RECONNECT_OK.
+
+  _hilo_heartbeat(servidor_ref, srv_lock, servidores, config, terminar) -> None
+      Hilo daemon. Envía HEARTBEAT cada HEARTBEAT_INTERVAL segundos.
+      Si no recibe HEARTBEAT_ACK, incrementa contador de fallos.
+      Tras MAX_FALLOS fallos consecutivos llama a _intentar_reconexion().
+      Buffer recv: 1024 bytes.
+
+  ejecutar(ip_servidor, puerto, id_cliente, servidores, intervalo_default=5.0)
+      -> None
+      Función principal: registra el cliente, inicia hilo heartbeat, entra en
+      loop de monitorización. Maneja respuestas REASSIGN (migra a nuevo servidor).
+
+Constantes hardcodeadas en este fichero:
+  50       -- workers del ThreadPoolExecutor para escaneo
+  0.3      -- timeout de descubrimiento (segundos)
+  5        -- timeout de envío de métricas (segundos)
+  1024     -- buffer recv del heartbeat (bytes)
+  4096     -- buffer recv de métricas (bytes)
+
+--------------------------------------------------------------------------------
+
+== 5.2  src/cliente/tolerancia_fallos/detector_servidor.py ==
+Propósito: CU3. Bucle independiente que envía heartbeats y detecta caída del
+servidor. Módulo alternativo al hilo heartbeat embebido en cliente_monitor.py.
+
+Imports: json, os, socket, time, argparse
+         from reconexion import intentar_reconexion
+
+Funciones:
+  _cargar_config() -> dict
+      Carga config.json.
+
+  _enviar_y_recibir(ip, puerto, mensaje: str, timeout: float) -> str | None
+      Envía texto plano por TCP y devuelve la respuesta.
+
+  ejecutar(servidor_inicial: tuple[str,int], servidores: list[tuple]) -> None
+      Loop principal: envía HEARTBEAT, espera HEARTBEAT_ACK, cuenta fallos.
+      Tras MAX_FALLOS fallos llama a intentar_reconexion().
+      Si no queda ningún servidor disponible, sale del proceso (RU-3).
+
+  _parsear_servidores(textos: list[str]) -> list[tuple[str, int]]
+      Convierte lista de strings "ip:puerto" a lista de tuplas.
+
+--------------------------------------------------------------------------------
+
+== 5.3  src/cliente/tolerancia_fallos/reconexion.py ==
+Propósito: CU3. Lógica de reconexión a un servidor alternativo.
+
+Imports: socket
+
+Funciones:
+  _enviar_y_recibir(ip, puerto, mensaje: str, timeout: float) -> str | None
+      Helper TCP genérico.
+
+  intentar_reconexion(servidor_caido: tuple[str,int],
+                       servidores: list[tuple[str,int]],
+                       heartbeat_timeout: float) -> tuple[str,int] | None
+      Prueba cada servidor de la lista (saltando el caído).
+      Envía "RECONNECT_REQUEST client server_caido=<ip>".
+      Devuelve (ip, puerto) del primer servidor que responda "RECONNECT_OK",
+      o None si todos fallan.
+
+--------------------------------------------------------------------------------
+
+== 5.4  src/servidor/alta_servidor/alta_server.py ==
+Propósito: CU1. Script de instalación de Zabbix + MariaDB para un nuevo servidor.
+Debe ejecutarse con sudo.
+
+Imports: os, subprocess, sys
+
+Funciones:
+  run(cmd, quiet=False, capture=False, input_data=None)
+      Wrapper de subprocess.run(). Imprime el comando antes de ejecutarlo.
+      Lanza SystemExit si el proceso falla (returncode != 0).
+
+  require_root()
+      Comprueba os.geteuid() == 0. Sale si no es root.
+
+  import_zabbix_schema()
+      Descomprime el schema SQL con zcat y lo importa en MariaDB
+      mediante pipe: zcat schema.sql.gz | mysql zabbix.
+
+  main()
+      Dos modos de operación determinados por argumento --master-ip:
+
+      Modo MASTER (primer servidor, sin --master-ip):
+        1. Descarga paquetes deb de Zabbix 7.0 LTS
+        2. Instala mariadb-server, zabbix-server-mysql, zabbix-frontend-php,
+           zabbix-apache-conf, zabbix-sql-scripts, zabbix-agent
+        3. Crea usuario y base de datos "zabbix" en MySQL
+        4. Importa schema SQL de Zabbix
+        5. Configura /etc/zabbix/zabbix_server.conf: DBPassword
+        6. Configura /etc/mysql/mariadb.conf.d/50-server.cnf: bind-address=0.0.0.0
+        7. Reinicia zabbix-server, zabbix-agent, apache2
+        8. Habilita servicios con systemctl enable
+
+      Modo SECUNDARIO (con --master-ip=<IP>):
+        1. Misma instalación de paquetes
+        2. NO instala MariaDB local
+        3. Configura DBHost al master IP en zabbix_server.conf
+        4. Configura PHP para frontend
+        5. Reinicia servicios
+
+Credenciales hardcodeadas:
+  Usuario DB:   zabbix
+  Password DB:  Zabbix_Pass1
+  Nombre nodo:  "Nodo Zabbix Secundario"
+
+Nota de seguridad: Las credenciales de BD están en texto plano en el script.
+No hay cifrado ni gestión de secretos.
+
+--------------------------------------------------------------------------------
+
+== 5.5  src/cliente/alta_cliente/alta_cliente.py ==
+Propósito: CU2. Instalación del agente Zabbix en un cliente con autodescubrimiento
+del servidor Zabbix mediante nmap.
+
+Imports: os, subprocess, sys
+
+Funciones:
+  run(cmd, quiet=False, capture=False, input_data=None)
+      Igual que en alta_server.py.
+
+  require_root()
+      Comprueba ejecución como root.
+
+  get_local_network() -> str
+      Obtiene la subred /24 local mediante:
+        ip -o -f inet addr show → extrae primera IP no-loopback → /24
+
+  find_zabbix_server_ip(network: str) -> str
+      Escanea la subred con nmap buscando el puerto TCP 10051 (Zabbix server).
+      Devuelve la primera IP con ese puerto abierto.
+
+  main()
+      Dos modos según argumento --server-ip:
+
+      Sin argumento (RU-1):
+        1. Instala/actualiza nmap si no está disponible
+        2. Descubre automáticamente el servidor Zabbix
+
+      Con --server-ip (RU-2):
+        1. Usa la IP proporcionada directamente
+
+      En ambos casos:
+        1. Descarga paquetes deb del agente Zabbix 7.0
+        2. Instala zabbix-agent
+        3. Modifica /etc/zabbix/zabbix_agentd.conf:
+             Server=<ip_descubierta>
+             ServerActive=<ip_descubierta>
+             HostnameItem=system.hostname   (autodescubrimiento de nombre)
+        4. Reinicia y habilita zabbix-agent
+
+Puerto Zabbix:  10051 (fijo para escaneo nmap en alta_cliente.py)
+
+--------------------------------------------------------------------------------
+
+== 5.6  src/servidor/monitorizacion/logger.py ==
+Propósito: Módulo compartido de logging. SOLO el servidor escribe en el log (RS-6).
+
+Imports: os, datetime
+
+Funciones:
+  _log(ruta_log: str, evento: str, detalle: str) -> None
+      Escribe una línea en el fichero de log Y en consola (stdout).
+      Crea el directorio y fichero si no existen.
+
+      Formato de salida:
+        [YYYY-MM-DD HH:MM:SS] [EVENTO_PADDED    ] detalle
+
+      El campo evento se rellena con espacios hasta 16 caracteres.
+
+Tipos de evento usados en el proyecto:
+  ALTA_CLIENTE       -- cliente registrado en el servidor
+  CAIDA_CLIENTE      -- cliente detectado como caído
+  CAIDA_SERVIDOR     -- servidor detectado como caído (desde cliente)
+  RECONEXION         -- cliente reconectado a nuevo servidor
+  REASIGNACION       -- cliente reasignado por balanceo de carga
+
+IMPORTANTE: No usar print(), logging, ni ningún otro mecanismo.
+Usar exclusivamente _log() de este módulo.
+
+--------------------------------------------------------------------------------
+
+== 5.7  src/servidor/monitorizacion/metricas.py ==
+Propósito: Cálculo de la carga del servidor y almacenamiento de datos monitorizados.
+
+Imports: json, os, platform, time
+
+Funciones:
+  _leer_meminfo() -> dict[str, int]
+      Parsea /proc/meminfo. Devuelve {campo: valor_kb}.
+
+  obtener_metricas_servidor() -> dict[str, Any]
+      Recopila: hostname, núcleos CPU (os.cpu_count()), promedios de carga
+      1/5/15 minutos, % memoria usada, timestamp.
+
+  calcular_carga(tiempos_monitorizacion: list, clientes_activos: int)
+      -> dict[str, Any]
+      Calcula la puntuación de carga compuesta del servidor:
+
+      Componentes:
+        tiempo_ms   = media(tiempos_monitorizacion) * 1000
+        load_norm   = min(100, (loadavg_1 / cores) * 100)
+        mem_pct     = (usada / total) * 100 desde /proc/meminfo
+        clientes    = clientes_activos
+
+      Fórmula:
+        score = min(100.0,
+          tiempo_ms * 0.20 +    (peso 20%: latencia de monitorización)
+          load_norm * 0.45 +    (peso 45%: carga CPU normalizada)
+          mem_pct   * 0.25 +    (peso 25%: presión de memoria)
+          clientes  * 3.5       (3.5 puntos por cliente, sin límite superior)
+        )
+
+      Devuelve dict con score, componentes individuales, timestamp.
+
+  guardar_carga(ruta: str, carga: dict) -> None
+      Escribe la carga actual como JSON en carga_srv<id>_<puerto>.json.
+      Sobreescribe en cada llamada (fichero de estado, no histórico).
+
+  registrar_datos_monitorizados(ruta: str, datos: dict) -> None
+      Añade los datos de monitorización como línea JSON al fichero
+      datos_monitorizados.log (append mode).
+
+--------------------------------------------------------------------------------
+
+== 5.8  src/servidor/monitorizacion/servidor_monitor.py ==
+Propósito: Servidor TCP principal. Registra clientes, procesa métricas,
+gestiona balanceo de carga y tolerancia a fallos.
+
+Imports: argparse, json, os, platform, socket, socketserver, sys, threading, time
+         from logger import _log
+         from metricas import calcular_carga, guardar_carga, registrar_datos_monitorizados
+         from tolerancia_fallos.monitor_clientes import iniciar_watchdog
+
+Clases:
+  EstadoMonitor
+      Estado compartido entre todos los hilos del servidor.
+
+      __init__(id_servidor, host, puerto, servidores, config, umbral_reasignacion)
+          Inicializa: dict de clientes, lock threading, lista de servidores conocidos,
+          lista de tiempos de monitorización, contadores.
+
+      registrar_cliente(client_id, client_ip, known_servers) -> None
+          Añade el cliente al dict interno. Actualiza lista de servidores conocidos
+          con los que el cliente reporta.
+
+      actualizar_metricas(client_id, payload, tiempo) -> None
+          Actualiza last_seen y métricas del cliente. Añade tiempo a la lista
+          (máximo 50 entradas, elimina el más antiguo si se supera).
+
+      obtener_carga() -> dict
+          Llama a calcular_carga() con los tiempos y número de clientes actuales.
+
+      candidato_reasignacion() -> tuple[str, int] | None
+          Consulta a todos los servidores conocidos su carga (LOAD_REQUEST).
+          Si alguno tiene score < (carga_local - umbral), lo devuelve como candidato.
+
+  _ThreadingTCPServer(socketserver.ThreadingTCPServer)
+      Subclase con allow_reuse_address = True para evitar "Address already in use".
+
+  _Handler(socketserver.BaseRequestHandler)
+      Manejador de conexiones. Un hilo por conexión (ThreadingTCPServer).
+
+      handle() -> None
+          Lee hasta 65535 bytes del socket.
+          Detecta tipo de mensaje por prefijo de texto:
+
+          "HEARTBEAT":
+            → Responde "HEARTBEAT_ACK"
+            → Actualiza last_seen del cliente
+
+          "RECONNECT_REQUEST client server_caido=<ip>":
+            → Responde "RECONNECT_OK"
+            → Registra evento RECONEXION en el log
+            → Actualiza last_seen del cliente
+
+          "LOAD_REQUEST":
+            → Calcula carga actual
+            → Responde "LOAD_RESPONSE <score>"
+
+          "REGISTER" (JSON con type="REGISTER"):
+            → Llama a estado.registrar_cliente()
+            → Registra evento ALTA_CLIENTE en el log
+            → Responde "MONITOR_REQUEST <intervalo>"
+
+          "METRICS" (JSON con type="METRICS"):
+            → Llama a estado.actualizar_metricas()
+            → Guarda métricas en log y fichero de carga
+            → Consulta candidato de reasignación
+            → Si existe candidato: responde "REASSIGN <ip> <puerto>"
+                                   registra evento REASIGNACION en log
+            → Si no: responde "METRICS_OK"
+
+Funciones:
+  _cargar_config() -> dict[str, Any]
+      Carga config.json.
+
+  _ruta_log_eventos(config: dict) -> str
+      Devuelve la ruta absoluta del log de eventos desde LOG_PATH en config.
+
+  _ruta_log_datos() -> str
+      Ruta al fichero datos_monitorizados.log.
+
+  _ruta_carga(id_servidor: str, puerto: int) -> str
+      Ruta al fichero de carga JSON del servidor.
+
+  _consultar_carga(ip: str, puerto: int) -> float | None
+      Abre socket TCP, envía "LOAD_REQUEST", parsea respuesta "LOAD_RESPONSE <n>".
+      Timeout: 2 segundos.
+
+  _parsear_servidores(textos: list[str]) -> list[tuple[str, int]]
+      Parsea lista de strings "ip:puerto".
+
+  ejecutar(host, puerto, id_servidor, servidores, umbral_reasignacion) -> None
+      Función principal:
+        1. Carga config
+        2. Crea EstadoMonitor
+        3. Inicia watchdog (iniciar_watchdog)
+        4. Arranca _ThreadingTCPServer en host:puerto
+        5. serve_forever()
+
+Constantes hardcodeadas:
+  65535  -- buffer recv del handler (bytes)
+  2      -- timeout de LOAD_REQUEST inter-servidor (segundos)
+  50     -- máximo de tiempos de monitorización almacenados en memoria
+
+--------------------------------------------------------------------------------
+
+== 5.9  src/servidor/tolerancia_fallos/monitor_clientes.py ==
+Propósito: CU4. Hilo watchdog que detecta clientes caídos y notifica al admin.
+
+Imports: os, sys, threading, time
+         from monitorizacion.logger import _log
+         from tolerancia_fallos.notificacion_admin import notificar_admin
+
+Funciones:
+  _watchdog(estado, umbral: float, ruta_log: str, activo: Event,
+            intervalo: float, admin_host: str, admin_puerto: int) -> None
+      Hilo daemon. Cada <intervalo> segundos revisa todos los clientes en estado.
+      Si time.time() - cliente.last_seen > umbral:
+        → Registra CAIDA_CLIENTE en el log
+        → Llama a notificar_admin(client_ip, admin_host, admin_puerto)
+        → Elimina el cliente del dict de estado
+
+      Umbral = MAX_FALLOS * HEARTBEAT_INTERVAL = 3 * 3 = 9 segundos (por defecto)
+
+  iniciar_watchdog(estado, ruta_log: str, config: dict) -> threading.Event
+      Crea y arranca el hilo watchdog como daemon.
+      Devuelve el Event de control (llamar a .clear() para detener).
+
+--------------------------------------------------------------------------------
+
+== 5.10  src/servidor/tolerancia_fallos/notificacion_admin.py ==
+Propósito: RS-10. Notifica al administrador la caída de un cliente.
+
+Imports: socket
+
+Funciones:
+  notificar_admin(client_ip: str, admin_host: str="", admin_puerto: int=9099)
+      -> None
+      Si admin_host está configurado (no vacío):
+        → Envía "CLIENT_DOWN client_ip=<ip>" por TCP con timeout 3 segundos
+      Siempre imprime el evento en consola (fallback).
+      No lanza excepciones; errores de red se capturan silenciosamente.
+
+--------------------------------------------------------------------------------
+6. ALGORITMOS CLAVE
+--------------------------------------------------------------------------------
+
+-- Autodescubrimiento de servidor (cliente_monitor.py: _descubrir_servidor) --
+  1. Prueba localhost:PUERTO (0.3s timeout)
+  2. Si falla: obtiene la subred /24 local desde socket.gethostname()
+  3. Lanza 50 hilos en paralelo (ThreadPoolExecutor)
+  4. Cada hilo prueba una IP de la subred con timeout 0.3s
+  5. Devuelve la primera IP que responde
+  6. Tiempo total aproximado: ~2 segundos para /24 completo
+
+-- Cálculo de uso de CPU (cliente_monitor.py: _leer_cpu_snapshot / _calcular_cpu_pct) --
+  Snapshot = (idle, total) leído de la primera línea de /proc/stat
+  idle  = campo 4 (idle time)
+  total = suma de todos los campos
+  uso % = 100 * (1 - delta_idle / delta_total)
+
+-- Cálculo de ancho de banda de subida (cliente_monitor.py) --
+  tx_bytes_total() suma /sys/class/net/<iface>/statistics/tx_bytes de todas las
+  interfaces válidas. La tasa se calcula como:
+    ancho_banda_bps = (tx_actual - tx_anterior) / (tiempo_actual - tiempo_anterior)
+
+-- Puntuación de carga del servidor (metricas.py: calcular_carga) --
+  score = min(100.0,
+    media(tiempos_ms) * 0.20 +    20% latencia monitorización
+    load_norm         * 0.45 +    45% carga CPU (loadavg_1 / cores * 100)
+    mem_pct           * 0.25 +    25% memoria usada
+    clientes_activos  * 3.5       3.5 puntos por cliente (sin límite)
+  )
+  Ejemplo (3 clientes, 2ms, loadavg=0.5 en 4 cores, mem=30%):
+    = 0.4 + 5.625 + 7.5 + 10.5 = 24.025
+
+-- Detección de caída y reconexión (hilo heartbeat / detector_servidor.py) --
+  1. Envía HEARTBEAT cada HEARTBEAT_INTERVAL (3s)
+  2. Espera HEARTBEAT_ACK con timeout HEARTBEAT_TIMEOUT (5s)
+  3. En fallo: incrementa contador
+  4. Tras MAX_FALLOS (3) fallos consecutivos → tiempo mínimo de detección: 9s
+  5. Llama a intentar_reconexion() con la lista de servidores conocidos
+  6. Si encuentra nuevo servidor: actualiza referencia y resetea contador
+  7. Si no encuentra ninguno: termina el proceso (RU-3)
+
+-- Balanceo de carga (servidor_monitor.py: candidato_reasignacion) --
+  1. Calcula la carga propia
+  2. Para cada servidor conocido: envía LOAD_REQUEST (timeout 2s)
+  3. Si score_remoto < score_local - umbral_reasignacion:
+       → El servidor remoto es candidato
+  4. Envía REASSIGN al cliente con la IP del candidato
+  5. El cliente se desconecta y registra con el nuevo servidor
+
+--------------------------------------------------------------------------------
+7. FLUJO DE DATOS DEL SISTEMA
+--------------------------------------------------------------------------------
+
+ARRANQUE SERVIDOR:
+  1. alta_server.py → instala Zabbix + MariaDB (solo una vez)
+  2. servidor_monitor.py → crea EstadoMonitor, inicia watchdog, escucha TCP
+
+ARRANQUE CLIENTE:
+  1. alta_cliente.py → instala agente Zabbix (solo una vez)
+  2. cliente_monitor.py → descubre servidor, se registra, entra en loop
+
+LOOP NORMAL (sin fallos):
+  Cliente:
+    Cada MONITOR_INTERVAL segundos:
+      capturar_metricas() → _enviar_mensaje(METRICS) → recibe METRICS_OK
+    Cada HEARTBEAT_INTERVAL segundos (hilo paralelo):
+      Envía HEARTBEAT → recibe HEARTBEAT_ACK
+
+  Servidor (por conexión entrante, hilo separado):
+    REGISTER → registra cliente, responde MONITOR_REQUEST
+    METRICS → actualiza estado, calcula carga, consulta otros srvs, responde
+    HEARTBEAT → responde ACK, actualiza last_seen
+
+  Servidor (watchdog, hilo continuo):
+    Cada HEARTBEAT_INTERVAL segundos: revisa last_seen de todos los clientes
+
+CAÍDA DE CLIENTE (detectada por servidor):
+  _watchdog detecta last_seen > umbral (9s)
+  → _log(CAIDA_CLIENTE, client_ip=...)
+  → notificar_admin(client_ip) → envía CLIENT_DOWN al admin por TCP
+  → Elimina cliente del estado
+
+CAÍDA DE SERVIDOR (detectada por cliente):
+  _hilo_heartbeat acumula MAX_FALLOS fallos
+  → _intentar_reconexion(servidor_caido, servidores_conocidos)
+  → Envía RECONNECT_REQUEST al nuevo servidor
+  → Nuevo servidor responde RECONNECT_OK, registra evento RECONEXION
+  → Cliente actualiza referencia al servidor y continúa
+
+REASIGNACIÓN POR CARGA:
+  Servidor recibe METRICS, calcula su carga, consulta otros servidores
+  → Si existe servidor con menos carga (diferencia > umbral)
+  → Responde REASSIGN <ip> <puerto> al cliente
+  → Servidor registra evento REASIGNACION
+  → Cliente llama a _parsear_destino(), migra al nuevo servidor
+
+--------------------------------------------------------------------------------
+8. MECANISMO DE LOGGING
+--------------------------------------------------------------------------------
+
+Fichero principal: src/servidor/logs/eventos.log
+Formato: [YYYY-MM-DD HH:MM:SS] [EVENTO_PADDED    ] detalle
+
+Segundo fichero: src/servidor/logs/datos_monitorizados.log
+Formato: JSON en cada línea (newline-delimited JSON), una línea por reporte de métricas
+
+Fichero de carga: src/servidor/logs/carga_srv<id>_<puerto>.json
+Formato: JSON con score y componentes, sobreescrito en cada actualización
+
+Regla: SOLO los módulos del servidor escriben en el log.
+       Usar siempre _log() de src/servidor/monitorizacion/logger.py.
+       Nunca usar print() ni logging de stdlib para eventos del sistema.
+
+--------------------------------------------------------------------------------
+9. PARÁMETROS Y CONSTANTES
+--------------------------------------------------------------------------------
+
+Configurables (config.json):
+  HEARTBEAT_INTERVAL   3s     -- entre heartbeats
+  HEARTBEAT_TIMEOUT    5s     -- espera de ACK
+  MAX_FALLOS           3      -- fallos para declarar caída
+  PUERTO_TCP           9000   -- puerto único de comunicación
+  LOG_PATH             src/servidor/logs/eventos.log
+  MONITOR_INTERVAL     5s     -- frecuencia de recolección de métricas
+  ADMIN_HOST           ""     -- IP del admin (vacío = sin notificación TCP)
+  ADMIN_PUERTO         9099
+
+Hardcodeadas en código:
+  50       cliente_monitor.py    -- workers para escaneo de subred
+  0.3s     cliente_monitor.py    -- timeout de descubrimiento
+  5s       cliente_monitor.py    -- timeout de envío de métricas
+  1024B    cliente_monitor.py    -- buffer recv heartbeat
+  4096B    cliente_monitor.py    -- buffer recv métricas
+  65535B   servidor_monitor.py   -- buffer recv del handler
+  2s       servidor_monitor.py   -- timeout LOAD_REQUEST inter-servidor
+  3s       notificacion_admin.py -- timeout notificación al admin
+  50       servidor_monitor.py   -- máx. tiempos almacenados en memoria
+  10051    alta_cliente.py       -- puerto Zabbix (para nmap)
+  0.20     metricas.py           -- peso tiempo en score de carga
+  0.45     metricas.py           -- peso CPU en score de carga
+  0.25     metricas.py           -- peso memoria en score de carga
+  3.5      metricas.py           -- puntos por cliente en score de carga
+
+Credenciales Zabbix (alta_server.py):
+  DB user:     zabbix
+  DB password: Zabbix_Pass1
+
+--------------------------------------------------------------------------------
+10. CASOS DE USO IMPLEMENTADOS
+--------------------------------------------------------------------------------
+
+CU1 -- Inserción de servidor:      alta_server.py (instala Zabbix + MariaDB)
+CU2 -- Inserción de cliente:       alta_cliente.py (instala agente Zabbix)
+CU3 -- Caída de servidor:          detector_servidor.py + reconexion.py
+                                    + _hilo_heartbeat en cliente_monitor.py
+CU4 -- Caída de cliente:           monitor_clientes.py (watchdog)
+CU5 -- Monitorización de clientes: cliente_monitor.py + servidor_monitor.py
+
+RU-1  Alta sin argumentos:         _descubrir_servidor() en cliente_monitor.py
+RU-2  Alta con IP de servidor:     argumento en cliente_monitor.py y alta_cliente.py
+RU-3  Fin si no hay servidores:    sys.exit en detector_servidor.py y ejecutar()
+RU-4  Monitorización del cliente:  loop en cliente_monitor.py:ejecutar()
+RU-5  Envío de métricas al srv:    _enviar_mensaje(METRICS) en cliente_monitor.py
+RU-6  Detección caída servidor:    _hilo_heartbeat + _intentar_reconexion
+
+RS-1  Alta servidor sin args:      alta_server.py sin --master-ip
+RS-2  Alta servidor con IP:        alta_server.py con --master-ip=<IP>
+RS-3  Recepción por TCP:           _ThreadingTCPServer en servidor_monitor.py
+RS-4  Monitorización:              _Handler.handle() procesa METRICS
+RS-5  Información de monit.:       capturar_metricas() en cliente_monitor.py
+RS-6  Log de eventos:              logger.py → eventos.log
+RS-7  Log de datos monitorizados:  registrar_datos_monitorizados() → datos_monitorizados.log
+RS-8  Carga del servidor:          calcular_carga() en metricas.py
+RS-9  Reasignación cliente-srv:    candidato_reasignacion() + REASSIGN en servidor_monitor.py
+RS-10 Notificación caída cliente:  notificacion_admin.py → CLIENT_DOWN
+
+--------------------------------------------------------------------------------
+11. NOTAS DE DISEÑO Y DECISIONES TÉCNICAS
+--------------------------------------------------------------------------------
+
+- No hay dependencias externas de Python. Todo es stdlib.
+- Concurrencia con threading (no asyncio). GIL limita paralelismo real de CPU.
+  Aceptable porque el cuello de botella es I/O de red, no CPU.
+- socketserver.ThreadingTCPServer: un hilo por conexión entrante.
+- El estado compartido (EstadoMonitor) usa un Lock para operaciones de escritura.
+- Los tiempos de monitorización se almacenan en una lista con tope de 50 entradas
+  para evitar crecimiento ilimitado de memoria.
+- La comunicación inter-servidor para consulta de carga (LOAD_REQUEST) tiene
+  timeout corto (2s) para no bloquear el handler del cliente esperando.
+- El cliente mantiene una lista de todos los servidores conocidos (se actualiza
+  con los que otros clientes reportan al registrarse).
+- No hay autenticación ni cifrado en ningún punto del protocolo TCP.
+- Los ficheros de setup (alta_server.py, alta_cliente.py) son scripts de
+  ejecución única, no módulos importables. Usan subprocess directamente.
+- Zabbix se usa como motor de monitorización de infraestructura; los scripts
+  Python son la capa de automatización, registro de eventos y tolerancia a fallos.
+
+--------------------------------------------------------------------------------
+12. POSIBLES MEJORAS / PUNTOS PENDIENTES
+--------------------------------------------------------------------------------
+
+- No hay receptor implementado para la notificación CLIENT_DOWN del admin.
+- La contraseña de la BD de Zabbix está hardcodeada en alta_server.py.
+- No hay integración directa entre alta_cliente.py y cliente_monitor.py
+  (son dos pasos manuales separados).
+- El autodescubrimiento de subred en cliente_monitor.py usa socket.gethostname()
+  para obtener la IP local, lo que puede fallar en configuraciones no estándar.
+- No se verifica que el servidor encontrado sea el correcto (sin autenticación).
+- El balanceo de carga usa umbral fijo; no hay historial de cargas para decisiones
+  más inteligentes.
+- Los tiempos de monitorización (hasta 50) y la fórmula de carga son aproximaciones
+  que deberían calibrarse con métricas reales del sistema.
+
+================================================================================
+FIN DEL FICHERO DE CONTEXTO
+================================================================================
