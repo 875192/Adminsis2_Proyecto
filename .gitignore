@@ -8,3 +8,9 @@ src/servidor/logs/*
 
 # Stubs de desarrollo local (no forman parte del sistema final)
 **/stubs/
+
+# Claude Code (configuración local del agente IA)
+CLAUDE.md
+AGENTS.md
+.claude/
+context_proyecto.txt
